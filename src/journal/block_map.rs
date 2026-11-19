@@ -184,10 +184,14 @@ impl<'a> BlockMapLoader<'a> {
     /// Note that this will skip the `journal_block_iter` past the data
     /// blocks that follow the descriptor block.
     fn process_descriptor_block(&mut self) -> Result<(), Ext4Error> {
-        validate_descriptor_block_checksum(self.superblock, &self.block)?;
+        if self.superblock.has_checksums() {
+            validate_descriptor_block_checksum(self.superblock, &self.block)?;
+        }
 
         let tags = DescriptorBlockTagIter::new(
             &self.block[JournalBlockHeader::SIZE..],
+            self.superblock.has_csum_v3(),
+            self.superblock.is_64bit(),
         );
 
         for tag in tags {
@@ -198,15 +202,19 @@ impl<'a> BlockMapLoader<'a> {
                 .next()
                 .ok_or(CorruptKind::JournalTruncated)??;
 
-            // Check the data block checksum.
-            let mut checksum = Checksum::new();
-            checksum.update(self.superblock.uuid.as_bytes());
-            checksum.update_u32_be(self.sequence);
-            self.fs
-                .read_from_block(block_index, 0, &mut self.data_block)?;
-            checksum.update(&self.data_block);
-            if checksum.finalize() != tag.checksum {
-                return Err(CorruptKind::JournalDescriptorTagChecksum.into());
+            // Check the data block checksum, if the journal is checksummed.
+            if let Some(expected) = tag.checksum {
+                let mut checksum = Checksum::new();
+                checksum.update(self.superblock.uuid.as_bytes());
+                checksum.update_u32_be(self.sequence);
+                self.fs
+                    .read_from_block(block_index, 0, &mut self.data_block)?;
+                checksum.update(&self.data_block);
+                if checksum.finalize() != expected {
+                    return Err(
+                        CorruptKind::JournalDescriptorTagChecksum.into()
+                    );
+                }
             }
 
             self.uncommitted_block_map
@@ -217,8 +225,15 @@ impl<'a> BlockMapLoader<'a> {
     }
 
     fn process_revocation_block(&mut self) -> Result<(), Ext4Error> {
-        validate_revocation_block_checksum(self.superblock, &self.block)?;
-        read_revocation_block_table(&self.block, &mut self.revoked_blocks)
+        if self.superblock.has_checksums() {
+            validate_revocation_block_checksum(self.superblock, &self.block)?;
+        }
+        read_revocation_block_table(
+            &self.block,
+            &mut self.revoked_blocks,
+            self.superblock.is_64bit(),
+            self.superblock.has_checksums(),
+        )
     }
 
     /// Process a commit block.
@@ -228,7 +243,9 @@ impl<'a> BlockMapLoader<'a> {
     /// are moved to `block_map`, and the sequence number is
     /// incremented.
     fn process_commit_block(&mut self) -> Result<(), Ext4Error> {
-        validate_commit_block_checksum(self.superblock, &self.block)?;
+        if self.superblock.has_checksums() {
+            validate_commit_block_checksum(self.superblock, &self.block)?;
+        }
 
         // Remove any revoked blocks from uncommitted blocks.
         for block_index in &self.revoked_blocks {

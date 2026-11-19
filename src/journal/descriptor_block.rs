@@ -48,59 +48,81 @@ pub(super) struct DescriptorBlockTag {
     /// with the data block associated with this tag.
     pub(super) block_index: FsBlockIndex,
 
-    /// Checksum of the block data.
+    /// Checksum of the block data, if the journal is checksummed
+    /// (`None` for a legacy journal with no checksums).
     ///
     /// Note that this checksum is for the data block associated with
     /// this tag. The data in the tag itself is covered by the
     /// descriptor block checksum.
-    pub(super) checksum: u32,
+    pub(super) checksum: Option<u32>,
 
     flags: DescriptorBlockTagFlags,
+
+    /// On-disk size of this tag: the base tag plus a 16-byte UUID unless
+    /// the `SAME_UUID` (UUID_OMITTED) flag is set.
+    encoded_size: usize,
 }
 
 impl DescriptorBlockTag {
-    const SIZE_WITHOUT_UUID: usize = 16;
-    const SIZE_WITH_UUID: usize = 32;
-
-    /// Size (in bytes) of the tag when encoded in a block.
-    fn encoded_size(&self) -> usize {
-        if self.flags.contains(DescriptorBlockTagFlags::UUID_OMITTED) {
-            Self::SIZE_WITHOUT_UUID
-        } else {
-            Self::SIZE_WITH_UUID
-        }
-    }
-
-    /// Read a tag from `bytes`.
+    /// Read a tag from `bytes`, selecting the on-disk layout from the
+    /// journal's feature flags:
+    ///
+    /// * `is_v3` (`CHECKSUM_V3`): `journal_block_tag3_t`, 16 bytes —
+    ///   `t_blocknr` / `t_flags` / `t_blocknr_high` / `t_checksum`, each
+    ///   a big-endian u32.
+    /// * legacy: `journal_block_tag_t` — `t_blocknr` be32, `t_checksum`
+    ///   be16 (unused: v2 checksums are not supported), `t_flags` be16;
+    ///   `t_blocknr_high` be32 follows only when 64-bit. Base size is 8,
+    ///   or 12 when 64-bit.
+    ///
+    /// Either layout is followed by a 16-byte UUID unless the
+    /// `SAME_UUID` flag is set.
     ///
     /// Returns `None` if there are not enough bytes to read the tag.
-    fn read_bytes(bytes: &[u8]) -> Option<Self> {
-        // Note: the tag format depends on feature flags in the journal
-        // superblock. The code in this function is only correct if the
-        // `CHECKSUM_V3` feature is enabled (this is checked when
-        // loading the superblock).
-
-        if bytes.len() < Self::SIZE_WITHOUT_UUID {
+    fn read_bytes(bytes: &[u8], is_v3: bool, is_64bit: bool) -> Option<Self> {
+        let base = if is_v3 {
+            16
+        } else if is_64bit {
+            12
+        } else {
+            8
+        };
+        if bytes.len() < base {
             return None;
         }
 
-        let t_blocknr = read_u32be(bytes, 0);
-        let t_flags = read_u32be(bytes, 4);
-        let t_blocknr_high = read_u32be(bytes, 8);
-        let t_checksum = read_u32be(bytes, 12);
+        let (blocknr_lo, blocknr_hi, flags_raw, checksum) = if is_v3 {
+            (
+                read_u32be(bytes, 0),
+                read_u32be(bytes, 8),
+                read_u32be(bytes, 4),
+                Some(read_u32be(bytes, 12)),
+            )
+        } else {
+            let hi = if is_64bit { read_u32be(bytes, 8) } else { 0 };
+            let flags = u16::from_be_bytes([bytes[6], bytes[7]]);
+            (read_u32be(bytes, 0), hi, u32::from(flags), None)
+        };
 
-        let flags = DescriptorBlockTagFlags::from_bits_retain(t_flags);
+        let flags = DescriptorBlockTagFlags::from_bits_retain(flags_raw);
+        let block_index = if is_64bit {
+            u64_from_hilo(blocknr_hi, blocknr_lo)
+        } else {
+            u64::from(blocknr_lo)
+        };
 
-        if !flags.contains(DescriptorBlockTagFlags::UUID_OMITTED)
-            && bytes.len() < Self::SIZE_WITH_UUID
-        {
+        let has_uuid =
+            !flags.contains(DescriptorBlockTagFlags::UUID_OMITTED);
+        let encoded_size = base + if has_uuid { 16 } else { 0 };
+        if has_uuid && bytes.len() < encoded_size {
             return None;
         }
 
         Some(Self {
-            block_index: u64_from_hilo(t_blocknr_high, t_blocknr),
+            block_index,
+            checksum,
             flags,
-            checksum: t_checksum,
+            encoded_size,
         })
     }
 }
@@ -113,14 +135,23 @@ pub(super) struct DescriptorBlockTagIter<'a> {
     /// Set to true after the last element (or an error) is
     /// returned. All future calls to `next` will return `None`.
     is_done: bool,
+
+    /// Journal uses the `CHECKSUM_V3` (`journal_block_tag3_t`) layout.
+    is_v3: bool,
+
+    /// Journal uses 64-bit block numbers.
+    is_64bit: bool,
 }
 
 impl<'a> DescriptorBlockTagIter<'a> {
-    /// Create a tag iterator from the raw bytes of a descriptor block.
-    pub(super) fn new(bytes: &'a [u8]) -> Self {
+    /// Create a tag iterator from the raw bytes of a descriptor block
+    /// (the bytes after the journal block header).
+    pub(super) fn new(bytes: &'a [u8], is_v3: bool, is_64bit: bool) -> Self {
         Self {
             bytes,
             is_done: false,
+            is_v3,
+            is_64bit,
         }
     }
 }
@@ -133,8 +164,11 @@ impl Iterator for DescriptorBlockTagIter<'_> {
             return None;
         }
 
-        let tag = if let Some(tag) = DescriptorBlockTag::read_bytes(self.bytes)
-        {
+        let tag = if let Some(tag) = DescriptorBlockTag::read_bytes(
+            self.bytes,
+            self.is_v3,
+            self.is_64bit,
+        ) {
             tag
         } else {
             // If there were not enough bytes left to read the next tag,
@@ -160,7 +194,7 @@ impl Iterator for DescriptorBlockTagIter<'_> {
         }
 
         // Update the remaining bytes.
-        self.bytes = &self.bytes[tag.encoded_size()..];
+        self.bytes = &self.bytes[tag.encoded_size..];
 
         Some(Ok(tag))
     }

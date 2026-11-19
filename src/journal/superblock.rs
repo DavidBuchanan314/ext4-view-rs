@@ -34,12 +34,18 @@ const SUPERBLOCK_CHECKSUM_OFFSET: usize = 0xfc;
 
 /// Features that must be present for this library to read the journal.
 const REQUIRED_FEATURES: JournalIncompatibleFeatures =
-    JournalIncompatibleFeatures::IS_64BIT
-        .union(JournalIncompatibleFeatures::CHECKSUM_V3);
+    JournalIncompatibleFeatures::empty();
 
 /// Features that may be present, but are not required.
+///
+/// Both modern (`CHECKSUM_V3`) and legacy (no checksum) journals are
+/// supported, with or without 64-bit block numbers. `CHECKSUM_V2` is not
+/// yet supported, so it is intentionally excluded (its presence is rejected
+/// rather than silently mis-verified).
 const ALLOWED_FEATURES: JournalIncompatibleFeatures =
-    JournalIncompatibleFeatures::BLOCK_REVOCATIONS;
+    JournalIncompatibleFeatures::BLOCK_REVOCATIONS
+        .union(JournalIncompatibleFeatures::IS_64BIT)
+        .union(JournalIncompatibleFeatures::CHECKSUM_V3);
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct JournalSuperblock {
@@ -56,9 +62,31 @@ pub(super) struct JournalSuperblock {
 
     /// Journal UUID used for checksums.
     pub(super) uuid: Uuid,
+
+    /// Incompatible feature flags (masked to the features this library
+    /// supports). Controls on-disk tag layout and checksum presence.
+    pub(super) incompat: JournalIncompatibleFeatures,
 }
 
 impl JournalSuperblock {
+    /// Whether the journal uses v3 checksums (which also selects the
+    /// `journal_block_tag3_t` tag layout).
+    pub(super) fn has_csum_v3(&self) -> bool {
+        self.incompat
+            .contains(JournalIncompatibleFeatures::CHECKSUM_V3)
+    }
+
+    /// Whether block numbers in the journal are 64-bit.
+    pub(super) fn is_64bit(&self) -> bool {
+        self.incompat.contains(JournalIncompatibleFeatures::IS_64BIT)
+    }
+
+    /// Whether the journal carries checksums (block tails, tag and data
+    /// checksums). Only v3 is supported, so this equals `has_csum_v3`.
+    pub(super) fn has_checksums(&self) -> bool {
+        self.has_csum_v3()
+    }
+
     /// Load the journal superblock from the filesystem.
     ///
     /// An error is returned if:
@@ -125,21 +153,34 @@ impl JournalSuperblock {
 
         check_incompat_features(s_feature_incompat)?;
 
-        // For now only one checksum type is supported.
-        if s_checksum_type != CHECKSUM_TYPE_CRC32C {
-            return Err(
-                IncompatibleKind::JournalChecksumType(s_checksum_type).into()
-            );
-        }
+        // Keep only the supported feature bits (unsupported ones were
+        // already rejected above).
+        let incompat =
+            JournalIncompatibleFeatures::from_bits_retain(s_feature_incompat)
+                & (REQUIRED_FEATURES | ALLOWED_FEATURES);
+        let has_checksums =
+            incompat.contains(JournalIncompatibleFeatures::CHECKSUM_V3);
 
-        // Validate the superblock checksum.
-        let mut checksum = Checksum::new();
-        checksum.update(&bytes[..SUPERBLOCK_CHECKSUM_OFFSET]);
-        checksum.update_u32_le(0);
-        checksum
-            .update(&bytes[SUPERBLOCK_CHECKSUM_OFFSET + 4..SUPERBLOCK_SIZE]);
-        if checksum.finalize() != s_checksum {
-            return Err(CorruptKind::JournalSuperblockChecksum.into());
+        // The checksum type and superblock checksum only apply when the
+        // journal is checksummed; a legacy journal leaves them unset.
+        if has_checksums {
+            if s_checksum_type != CHECKSUM_TYPE_CRC32C {
+                return Err(IncompatibleKind::JournalChecksumType(
+                    s_checksum_type,
+                )
+                .into());
+            }
+
+            // Validate the superblock checksum.
+            let mut checksum = Checksum::new();
+            checksum.update(&bytes[..SUPERBLOCK_CHECKSUM_OFFSET]);
+            checksum.update_u32_le(0);
+            checksum.update(
+                &bytes[SUPERBLOCK_CHECKSUM_OFFSET + 4..SUPERBLOCK_SIZE],
+            );
+            if checksum.finalize() != s_checksum {
+                return Err(CorruptKind::JournalSuperblockChecksum.into());
+            }
         }
 
         // OK to unwrap: `s_uuid` is always 16 bytes.
@@ -150,6 +191,7 @@ impl JournalSuperblock {
             sequence: s_sequence,
             start_block: s_start,
             uuid,
+            incompat,
         })
     }
 }

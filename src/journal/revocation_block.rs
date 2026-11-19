@@ -43,47 +43,42 @@ pub(super) fn validate_revocation_block_checksum(
 pub(super) fn read_revocation_block_table(
     block: &[u8],
     table: &mut Vec<FsBlockIndex>,
+    is_64bit: bool,
+    has_checksums: bool,
 ) -> Result<(), Ext4Error> {
-    // Note: if this library adds support for 32-bit journals, this
-    // size will need to be conditionally set to either 4 or 8.
-    const BLOCK_INDEX_SIZE_IN_BYTES: usize = 8;
+    // Revocation records are 4 bytes (32-bit journal) or 8 bytes (64-bit).
+    let record_len: usize = if is_64bit { 8 } else { 4 };
+    // The 4-byte block tail checksum is only present on checksummed journals.
+    let csum_size: usize = if has_checksums { 4 } else { 0 };
 
-    // Skip past the block header bytes, and remove the trailing
-    // checksum bytes.
-    let data = &block[JournalBlockHeader::SIZE..
-               // OK to unwrap: minimum block length is 1024.
-               block.len().checked_sub(4).unwrap()];
+    // On-disk layout (jbd2 `jbd2_journal_revoke_header_t`): the 12-byte
+    // journal block header, then `r_count` (be32) = the total number of
+    // bytes used in the block (header + count + records). Records run from
+    // offset 16 up to `r_count`.
+    const HEADER_LEN: usize = JournalBlockHeader::SIZE; // 12
+    const RECORDS_START: usize = HEADER_LEN + size_of::<u32>(); // 16
 
-    // Get the size (in bytes) of the block-index array.
-    let num_bytes = usize_from_u32(read_u32be(data, 0));
-
-    // Ensure that the table size is an even multiple of the index size.
-    if num_bytes % BLOCK_INDEX_SIZE_IN_BYTES != 0 {
+    let r_count = usize_from_u32(read_u32be(block, HEADER_LEN));
+    if r_count < RECORDS_START
+        || r_count > block.len().saturating_sub(csum_size)
+    {
         return Err(CorruptKind::JournalRevocationBlockInvalidTableSize(
-            num_bytes,
+            r_count,
         )
         .into());
     }
 
-    // Skip past the size field.
-    let data = &data[size_of::<u32>()..];
-
-    // Ensure that the table size fits within the block.
-    let mut data = data.get(..num_bytes).ok_or(
-        CorruptKind::JournalRevocationBlockInvalidTableSize(num_bytes),
-    )?;
-
-    // Read each entry and append to `table`.
-    while !data.is_empty() {
-        let block_index = u64::from_be_bytes(
-            // OK to unwrap: `BLOCK_INDEX_SIZE_IN_BYTES` matches the
-            // size of `u64`.
-            data[..BLOCK_INDEX_SIZE_IN_BYTES].try_into().unwrap(),
-        );
-
+    // Read each record from [RECORDS_START, r_count) and append to `table`.
+    let mut offset = RECORDS_START;
+    while offset + record_len <= r_count {
+        let block_index = if record_len == 8 {
+            // OK to unwrap: slice length matches u64.
+            u64::from_be_bytes(block[offset..offset + 8].try_into().unwrap())
+        } else {
+            u64::from(read_u32be(block, offset))
+        };
         table.push(block_index);
-
-        data = &data[BLOCK_INDEX_SIZE_IN_BYTES..];
+        offset += record_len;
     }
 
     Ok(())
