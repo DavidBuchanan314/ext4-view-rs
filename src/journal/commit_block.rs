@@ -46,6 +46,7 @@ pub(super) fn validate_commit_block_checksum(
 mod tests {
     use super::*;
     use crate::Uuid;
+    use crate::journal::superblock::JournalIncompatibleFeatures;
 
     /// Test success and failure cases of `validate_commit_block_checksum`.
     #[test]
@@ -55,6 +56,7 @@ mod tests {
             sequence: 0,
             start_block: 0,
             uuid: Uuid([0; 16]),
+            incompat: JournalIncompatibleFeatures::empty(),
         };
 
         // Valid checksum.

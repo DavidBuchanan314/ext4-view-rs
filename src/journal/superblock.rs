@@ -260,6 +260,8 @@ mod tests {
                     0xd2, 0x28, 0xa8, 0x78, 0xb9, 0xa7, 0x49, 0xe4, 0x9e, 0x3d,
                     0xbb, 0xee, 0xd5, 0x60, 0x1c, 0xd3
                 ]),
+                incompat: JournalIncompatibleFeatures::IS_64BIT
+                    | JournalIncompatibleFeatures::CHECKSUM_V3,
             }
         );
     }
@@ -302,6 +304,8 @@ mod tests {
                 sequence: 123,
                 start_block: 456,
                 uuid: Uuid([0xab; 16]),
+                incompat: JournalIncompatibleFeatures::IS_64BIT
+                    | JournalIncompatibleFeatures::CHECKSUM_V3,
             }
         );
     }
@@ -329,16 +333,27 @@ mod tests {
     }
 
     #[test]
-    fn test_journal_superblock_missing_required_features() {
+    fn test_journal_superblock_legacy_no_checksum() {
+        // A legacy journal (no checksum, no 64-bit — e.g. REVOKE-only) has no
+        // required features and must load. The checksum type and superblock
+        // checksum fields are not validated when checksums are absent.
         let mut block = create_test_superblock();
-        write_u32be(&mut block, SUPERBLOCK_FEATURE_INCOMPAT_OFFSET, 0);
+        write_u32be(
+            &mut block,
+            SUPERBLOCK_FEATURE_INCOMPAT_OFFSET,
+            JournalIncompatibleFeatures::BLOCK_REVOCATIONS.bits(),
+        );
+        block[SUPERBLOCK_CHECKSUM_TYPE_OFFSET] = 0;
+        write_u32be(&mut block, SUPERBLOCK_CHECKSUM_OFFSET, 0);
         assert_eq!(
-            JournalSuperblock::read_bytes(&block).unwrap_err(),
-            IncompatibleKind::MissingRequiredJournalFeatures(
-                (JournalIncompatibleFeatures::IS_64BIT
-                    | JournalIncompatibleFeatures::CHECKSUM_V3)
-                    .bits()
-            ),
+            JournalSuperblock::read_bytes(&block).unwrap(),
+            JournalSuperblock {
+                block_size: 4096,
+                sequence: 123,
+                start_block: 456,
+                uuid: Uuid([0xab; 16]),
+                incompat: JournalIncompatibleFeatures::BLOCK_REVOCATIONS,
+            }
         );
     }
 

@@ -214,6 +214,7 @@ bitflags! {
 mod tests {
     use super::*;
     use crate::Uuid;
+    use crate::journal::superblock::JournalIncompatibleFeatures;
 
     /// Test success and failure cases of `validate_descriptor_block_checksum`.
     #[test]
@@ -223,6 +224,7 @@ mod tests {
             sequence: 0,
             start_block: 0,
             uuid: Uuid([0; 16]),
+            incompat: JournalIncompatibleFeatures::CHECKSUM_V3,
         };
         let mut block = vec![0; 1024];
         assert_eq!(
@@ -268,19 +270,63 @@ mod tests {
         bytes.extend([0; 16]);
 
         assert_eq!(
-            DescriptorBlockTagIter::new(&bytes)
+            DescriptorBlockTagIter::new(&bytes, true, true)
                 .map(Result::unwrap)
                 .collect::<Vec<_>>(),
             [
                 DescriptorBlockTag {
                     block_index: 0xa000_0000_1000,
                     flags: DescriptorBlockTagFlags::UUID_OMITTED,
-                    checksum: 0x123,
+                    checksum: Some(0x123),
+                    encoded_size: 16,
                 },
                 DescriptorBlockTag {
                     block_index: 0xb000_0000_2000,
                     flags: DescriptorBlockTagFlags::LAST_TAG,
-                    checksum: 0x456,
+                    checksum: Some(0x456),
+                    encoded_size: 32,
+                }
+            ]
+        );
+    }
+
+    /// Test `DescriptorBlockTagIter` on a legacy (no-checksum, 32-bit)
+    /// descriptor block: 8-byte tags, no per-tag checksum.
+    #[test]
+    fn test_descriptor_block_tag_iter_legacy() {
+        let mut bytes = vec![];
+
+        // Tag 1 (no UUID): blocknr be32, checksum be16 (unused), flags be16.
+        push_u32be(&mut bytes, 0x1000);
+        bytes.extend(0u16.to_be_bytes());
+        bytes.extend(
+            (DescriptorBlockTagFlags::UUID_OMITTED.bits() as u16).to_be_bytes(),
+        );
+
+        // Tag 2 (last, with UUID).
+        push_u32be(&mut bytes, 0x2000);
+        bytes.extend(0u16.to_be_bytes());
+        bytes.extend(
+            (DescriptorBlockTagFlags::LAST_TAG.bits() as u16).to_be_bytes(),
+        );
+        bytes.extend([0; 16]);
+
+        assert_eq!(
+            DescriptorBlockTagIter::new(&bytes, false, false)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            [
+                DescriptorBlockTag {
+                    block_index: 0x1000,
+                    flags: DescriptorBlockTagFlags::UUID_OMITTED,
+                    checksum: None,
+                    encoded_size: 8,
+                },
+                DescriptorBlockTag {
+                    block_index: 0x2000,
+                    flags: DescriptorBlockTagFlags::LAST_TAG,
+                    checksum: None,
+                    encoded_size: 24,
                 }
             ]
         );
@@ -291,7 +337,7 @@ mod tests {
     fn test_descriptor_block_tag_iter_empty() {
         let bytes = vec![];
         assert_eq!(
-            DescriptorBlockTagIter::new(&bytes)
+            DescriptorBlockTagIter::new(&bytes, true, true)
                 .next()
                 .unwrap()
                 .unwrap_err(),
@@ -317,7 +363,7 @@ mod tests {
         // Intentionally leave out the UUID bytes to produce an error.
 
         assert_eq!(
-            DescriptorBlockTagIter::new(&bytes)
+            DescriptorBlockTagIter::new(&bytes, true, true)
                 .next()
                 .unwrap()
                 .unwrap_err(),
@@ -347,7 +393,7 @@ mod tests {
         push_u32be(&mut bytes, 0x456);
 
         assert_eq!(
-            DescriptorBlockTagIter::new(&bytes)
+            DescriptorBlockTagIter::new(&bytes, true, true)
                 .next()
                 .unwrap()
                 .unwrap_err(),
